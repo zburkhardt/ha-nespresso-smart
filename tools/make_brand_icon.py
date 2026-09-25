@@ -7,10 +7,11 @@ iOS-style squircle, then writes the sizes Home Assistant wants:
     custom_components/nespresso_smart/brand/icon.png      256x256
     custom_components/nespresso_smart/brand/icon@2x.png   512x512
 
-The squircle is a superellipse, |x|^n + |y|^n = 1. Apple's icon shape is a
-continuous-curvature rounded rect; n = 5 tracks it closely enough that the two
-are hard to tell apart at icon sizes, and it avoids the corner "wobble" you get
-from a plain rounded rectangle.
+The squircle is Apple's icon shape: a rounded rect with continuous curvature,
+the one Figma calls corner smoothing. Not a superellipse, whose edges bow
+outward. The mask is rendered with rsvg-convert (`brew install librsvg`) from
+the same path the other integrations draw their tiles with, so every icon
+shares one outline.
 
 The source icon's own corners are only slightly rounded, so the squircle is
 strictly inside them and masking never clips the artwork. The N and the ring's
@@ -21,47 +22,99 @@ dots sit at the centre and at the edge midpoints, away from the corners.
 
 from __future__ import annotations
 
+import io
+import math
 import pathlib
+import subprocess
 import sys
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SRC = REPO / "work" / "xapk" / "icon.png"
 OUT = REPO / "custom_components" / "nespresso_smart" / "brand"
 
-#: Superellipse exponent. Lower is rounder (4 looks blobby, 2 would be a circle),
-#: higher is boxier with flatter sides (6 is already noticeably square). 5 is the
-#: usual approximation of the iOS app-icon shape.
-EXPONENT = 5.0
-
-#: Supersampling factor for the mask. The squircle edge is a curve, so we draw
-#: it big and downsample to get clean antialiasing rather than jaggies.
-SUPERSAMPLE = 8
+#: Apple's app-icon corner, as a fraction of the width, with Figma's equivalent
+#: corner-smoothing value. These two numbers *are* the iOS icon shape; see squircle().
+CORNER_RADIUS_RATIO = 0.2237
+CORNER_SMOOTHING = 0.6
 
 
-def squircle_mask(size: int, exponent: float = EXPONENT) -> Image.Image:
-    """Return an 'L' mask of a superellipse filling a size x size square."""
-    hi = size * SUPERSAMPLE
-    mask = Image.new("L", (hi, hi), 0)
-    draw = ImageDraw.Draw(mask)
+def squircle(size: float) -> str:
+    """Return the iOS app-icon shape as an SVG path, inscribed in a `size` square.
 
-    r = hi / 2.0
-    # Walk the top edge, solve the superellipse for y, and mirror. Building a
-    # polygon this way keeps the curve exact rather than approximating with arcs.
-    points: list[tuple[float, float]] = []
-    steps = hi
-    for i in range(steps + 1):
-        x = -1.0 + 2.0 * i / steps
-        y = (max(0.0, 1.0 - abs(x) ** exponent)) ** (1.0 / exponent)
-        points.append((r + x * r, r - y * r))
-    for i in range(steps, -1, -1):
-        x = -1.0 + 2.0 * i / steps
-        y = (max(0.0, 1.0 - abs(x) ** exponent)) ** (1.0 / exponent)
-        points.append((r + x * r, r + y * r))
+    Not a superellipse. The obvious implementation — `|x|^n + |y|^n = 1` with n
+    around 5 — is the shape most people mean by "squircle", but it is not the one
+    Apple uses, and the difference is visible: a superellipse curves continuously
+    everywhere, so the edges that should be flat bow outward. Side by side against
+    a real app icon it reads as pillowed.
 
-    draw.polygon(points, fill=255)
-    return mask.resize((size, size), Image.LANCZOS)
+    Apple's mask is a *rounded rectangle with continuous curvature*, as produced by
+    `UIBezierPath(roundedRect:cornerRadius:)`: genuinely straight edges, with the
+    corner easing curvature in over a longer run than a circular arc would. This is
+    the construction Figma exposes as "corner smoothing", at the iOS values.
+
+    A circular corner is still wrong for the reason you would expect — curvature
+    jumps from 0 to 1/r at the join — but the fix is smoothing the transition, not
+    abandoning the straight edge.
+    """
+    radius = size * CORNER_RADIUS_RATIO
+    budget = size / 2
+
+    # Keep the corner inside the space available to it; without the cap a large
+    # radius yields a self-intersecting path rather than a clipped one.
+    smoothing = min(CORNER_SMOOTHING, budget / radius - 1)
+    p = min((1 + smoothing) * radius, budget)
+
+    arc_measure = math.radians(90 * (1 - smoothing))
+    arc = math.sin(arc_measure / 2) * radius * math.sqrt(2)
+
+    angle_alpha = (math.pi / 2 - arc_measure) / 2
+    angle_beta = math.radians(45 * smoothing)
+    c = radius * math.tan(angle_alpha / 2) * math.cos(angle_beta)
+    d = c * math.tan(angle_beta)
+
+    # The straight run into each corner splits 2:1 between the two off-curve
+    # control points. That ratio is what ramps curvature smoothly.
+    b = (p - arc - c - d) / 3
+    a = 2 * b
+
+    def f(value: float) -> str:
+        return f"{value:.4f}"
+
+    return " ".join(
+        [
+            f"M {f(size - p)} 0",
+            f"c {f(a)} 0 {f(a + b)} 0 {f(a + b + c)} {f(d)}",
+            f"a {f(radius)} {f(radius)} 0 0 1 {f(arc)} {f(arc)}",
+            f"c {f(d)} {f(c)} {f(d)} {f(b + c)} {f(d)} {f(a + b + c)}",
+            f"L {f(size)} {f(size - p)}",
+            f"c 0 {f(a)} 0 {f(a + b)} {f(-d)} {f(a + b + c)}",
+            f"a {f(radius)} {f(radius)} 0 0 1 {f(-arc)} {f(arc)}",
+            f"c {f(-c)} {f(d)} {f(-(b + c))} {f(d)} {f(-(a + b + c))} {f(d)}",
+            f"L {f(p)} {f(size)}",
+            f"c {f(-a)} 0 {f(-(a + b))} 0 {f(-(a + b + c))} {f(-d)}",
+            f"a {f(radius)} {f(radius)} 0 0 1 {f(-arc)} {f(-arc)}",
+            f"c {f(-d)} {f(-c)} {f(-d)} {f(-(b + c))} {f(-d)} {f(-(a + b + c))}",
+            f"L 0 {f(p)}",
+            f"c 0 {f(-a)} 0 {f(-(a + b))} {f(d)} {f(-(a + b + c))}",
+            f"a {f(radius)} {f(radius)} 0 0 1 {f(arc)} {f(-arc)}",
+            f"c {f(c)} {f(-d)} {f(b + c)} {f(-d)} {f(a + b + c)} {f(-d)}",
+            "Z",
+        ]
+    )
+
+
+def squircle_mask(size: int) -> Image.Image:
+    """Return an 'L' mask of the iOS icon shape filling a size x size square."""
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+        f'viewBox="0 0 {size} {size}"><path d="{squircle(size)}"/></svg>'
+    )
+    png = subprocess.run(
+        ["rsvg-convert"], input=svg.encode(), capture_output=True, check=True
+    ).stdout
+    return Image.open(io.BytesIO(png)).getchannel("A")
 
 
 def main() -> None:
