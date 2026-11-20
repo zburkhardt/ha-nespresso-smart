@@ -11,6 +11,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, TypeVar
 
 from bleak import BleakClient
@@ -109,8 +110,10 @@ class VertuoDevice:
         seed: str,
         *,
         disconnected_callback: Callable[[], None] | None = None,
+        refresh_ble_device: Callable[[], BLEDevice] | None = None,
     ) -> None:
         self._ble_device = ble_device
+        self._refresh_ble_device = refresh_ble_device
         self._seed = seed
         self._secret = derive_secret(seed)
         self._client: BleakClient | None = None
@@ -118,6 +121,8 @@ class VertuoDevice:
         self._disconnected_callback = disconnected_callback
         self._status_callback: Callable[[MachineStatus], None] | None = None
         self._notifying = False
+        self._latest_notification: MachineStatus | None = None
+        self.update_stage = "connect"
         # Cleared only once the backend says it cannot bond at all; a bond
         # that merely failed this time is worth attempting again. See _bond.
         self._try_bonding = True
@@ -141,10 +146,6 @@ class VertuoDevice:
     @property
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected
-
-    def set_ble_device(self, ble_device: BLEDevice) -> None:
-        """Refresh the underlying device (HA hands us a new one per advert)."""
-        self._ble_device = ble_device
 
     def set_status_callback(
         self, callback: Callable[[MachineStatus], None] | None
@@ -175,11 +176,39 @@ class VertuoDevice:
 
     # --- connection ------------------------------------------------------
 
-    def _on_disconnect(self, _client: BleakClient) -> None:
-        _LOGGER.debug("%s: disconnected", self.name)
+    def _retire_client(self) -> BleakClient | None:
+        client, self._client = self._client, None
         self._notifying = False
-        if self._disconnected_callback:
+        self._latest_notification = None
+        if client is not None and self._disconnected_callback is not None:
             self._disconnected_callback()
+        return client
+
+    def _on_disconnect(self, client: BleakClient) -> None:
+        if client is self._client:
+            _LOGGER.debug("%s: disconnected", self.name)
+            self._retire_client()
+
+    async def _open_link(self) -> None:
+        self._retire_client()
+        if self._refresh_ble_device is not None:
+            self.update_stage = "discovery"
+            self._ble_device = self._refresh_ble_device()
+        self.update_stage = "connect"
+        _LOGGER.debug("%s: connecting", self.name)
+        self._client = await establish_connection(
+            BleakClient,
+            self._ble_device,
+            self.name,
+            disconnected_callback=self._on_disconnect,
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def _connected_client(self) -> BleakClient:
+        client = self._client
+        if client is None or not client.is_connected:
+            raise VertuoError("Bluetooth link disconnected")
+        return client
 
     async def connect(self) -> None:
         """Connect, bond and authenticate. Idempotent."""
@@ -195,13 +224,7 @@ class VertuoDevice:
         async with self._lock:
             if self.is_connected:
                 return
-            self._client = await establish_connection(
-                BleakClient,
-                self._ble_device,
-                self.name,
-                disconnected_callback=self._on_disconnect,
-                timeout=DEFAULT_TIMEOUT,
-            )
+            await self._open_link()
             try:
                 await self._bond()
             except BaseException:
@@ -217,14 +240,7 @@ class VertuoDevice:
         if self.is_connected:
             return
 
-        _LOGGER.debug("%s: connecting", self.name)
-        self._client = await establish_connection(
-            BleakClient,
-            self._ble_device,
-            self.name,
-            disconnected_callback=self._on_disconnect,
-            timeout=DEFAULT_TIMEOUT,
-        )
+        await self._open_link()
 
         # Tear the link down if it does not come up fully authenticated.
         # Otherwise self._client stays set and connected, every later call
@@ -234,7 +250,9 @@ class VertuoDevice:
         # matters most for the one failure this integration *expects*: the
         # unbonded-link refusal, whose whole design is that a retry fixes it.
         try:
+            self.update_stage = "bond"
             await self._bond()
+            self.update_stage = "authenticate"
             await self._authenticate()
         except BaseException:
             await self._disconnect_locked()
@@ -261,11 +279,11 @@ class VertuoDevice:
         property of the backend (macOS bonds implicitly instead). Everything
         else may well succeed on the next connection, so keep trying.
         """
-        assert self._client is not None
+        client = self._connected_client()
         if not self._try_bonding:
             return
         try:
-            await self._bounded(self._client.pair(), BOND_TIMEOUT, "bonding")
+            await self._bounded(client.pair(), BOND_TIMEOUT, "bonding")
         except NotImplementedError:
             self._try_bonding = False
             _LOGGER.debug("%s: pair() unsupported on this backend, skipping", self.name)
@@ -289,10 +307,10 @@ class VertuoDevice:
         exception type because it is transient -- the refusal is what prompts
         the bond, so the next connection attempt succeeds.
         """
-        assert self._client is not None
+        client = self._connected_client()
         try:
             await self._bounded(
-                self._client.write_gatt_char(char, data, response=True),
+                client.write_gatt_char(char, data, response=True),
                 GATT_TIMEOUT,
                 what,
             )
@@ -310,11 +328,9 @@ class VertuoDevice:
         on an unbonded link in both directions, so a read can be transient
         for exactly the same reason a write can.
         """
-        assert self._client is not None
+        client = self._connected_client()
         try:
-            return await self._bounded(
-                self._client.read_gatt_char(char), GATT_TIMEOUT, what
-            )
+            return await self._bounded(client.read_gatt_char(char), GATT_TIMEOUT, what)
         except BleakError as err:
             if "not paired" in str(err).lower():
                 raise VertuoNotBondedError(
@@ -324,7 +340,6 @@ class VertuoDevice:
 
     async def _authenticate(self) -> None:
         """Write the pairing secret to the CMID characteristic."""
-        assert self._client is not None
         try:
             await self._write(CHAR_CMID, self._secret, "writing the pairing key")
         except BleakError as err:
@@ -357,10 +372,19 @@ class VertuoDevice:
         wedge described in _connect_locked -- strictly worse than letting
         establish_connection sort out a link BlueZ may not have released.
         """
-        client, self._client = self._client, None
-        self._notifying = False
+        client = self._retire_client()
         if client is None:
             return
+        # Unloading can cancel a refresh while it is already closing the old
+        # link. Finish releasing that slot before the caller drops the task.
+        disconnect = asyncio.create_task(self._close_client(client))
+        try:
+            await asyncio.shield(disconnect)
+        except asyncio.CancelledError:
+            await disconnect
+            raise
+
+    async def _close_client(self, client: BleakClient) -> None:
         try:
             await self._bounded(
                 client.disconnect(), DISCONNECT_TIMEOUT, "disconnecting"
@@ -415,46 +439,62 @@ class VertuoDevice:
 
     # --- notifications ---------------------------------------------------
 
-    def _handle_status_notify(self, _sender: object, data: bytearray) -> None:
-        if self._status_callback is None:
+    def _handle_status_notify(
+        self, client: BleakClient, _sender: object, data: bytearray
+    ) -> None:
+        if client is not self._client or not client.is_connected:
             return
         try:
-            self._status_callback(decode_machine_status(bytes(data)))
+            status = decode_machine_status(bytes(data))
         except (ValueError, IndexError) as err:
             _LOGGER.debug("%s: bad status notification %s: %s", self.name, data, err)
+            return
+        self._latest_notification = status
+        if self._status_callback is not None:
+            self._status_callback(status)
 
     async def start_notifications(self) -> None:
         """Subscribe to MachineStatus so state changes arrive immediately."""
         async with self._lock:
             await self._connect_locked()
-            if self._notifying:
-                return
-            assert self._client is not None
-            try:
-                await self._bounded(
-                    self._client.start_notify(
-                        CHAR_MACHINE_STATUS, self._handle_status_notify
-                    ),
-                    GATT_TIMEOUT,
-                    "subscribing to MachineStatus",
-                )
-                self._notifying = True
-            except (BleakError, VertuoTimeoutError) as err:
-                # Not fatal -- polling still works.
-                _LOGGER.debug("%s: could not subscribe to status: %s", self.name, err)
+            await self._start_notifications_locked(self._connected_client())
+
+    async def _start_notifications_locked(self, client: BleakClient) -> None:
+        if self._notifying:
+            return
+        try:
+            await self._bounded(
+                client.start_notify(
+                    CHAR_MACHINE_STATUS, partial(self._handle_status_notify, client)
+                ),
+                GATT_TIMEOUT,
+                "subscribing to MachineStatus",
+            )
+        except (BleakError, VertuoTimeoutError) as err:
+            # Not fatal -- polling still works.
+            _LOGGER.debug("%s: could not subscribe to status: %s", self.name, err)
+        else:
+            self._notifying = client is self._client and client.is_connected
 
     # --- reads -----------------------------------------------------------
 
-    async def update(self) -> VertuoData:
+    async def update(self, *, subscribe: bool = False) -> VertuoData:
         """Connect if needed and read the full machine state."""
         async with self._lock:
+            self.update_stage = "connect"
             await self._connect_locked()
-            assert self._client is not None
+            client = self._connected_client()
+            if subscribe:
+                self.update_stage = "subscribe"
+                await self._start_notifications_locked(client)
 
+            self.update_stage = "read_status"
+            previous_notification = self._latest_notification
             status = decode_machine_status(
                 await self._read(CHAR_MACHINE_STATUS, "reading MachineStatus")
             )
 
+            self.update_stage = "read_metadata"
             if self._info is None:
                 self._info = await self._read_optional(
                     CHAR_MACHINE_INFO, decode_machine_info, "machine info"
@@ -471,6 +511,12 @@ class VertuoDevice:
             settings = await self._read_optional(
                 CHAR_USER_SETTINGS, decode_user_settings, "user settings"
             )
+
+            if client is not self._client or not client.is_connected:
+                raise VertuoError("Bluetooth link disconnected during update")
+            notification = self._latest_notification
+            if notification is not None and notification is not previous_notification:
+                status = notification
 
             return VertuoData(
                 status=status,

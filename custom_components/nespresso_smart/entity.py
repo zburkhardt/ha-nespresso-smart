@@ -52,4 +52,4 @@ class VertuoEntity(CoordinatorEntity[VertuoCoordinator]):
 
     @property
     def available(self) -> bool:
-        return super().available and self.coordinator.data is not None
+        return super().available and self.coordinator.has_live_status

@@ -43,6 +43,7 @@ class VertuoConfigFlow(ConfigFlow, domain=DOMAIN):
         self._address: str | None = None
         self._name: str | None = None
         self._discovered: dict[str, str] = {}
+        self._onboarding_seed: str | None = None
 
     # --- entry points ----------------------------------------------------
 
@@ -66,7 +67,10 @@ class VertuoConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle a manually started flow: pick from discovered machines."""
         if user_input is not None:
-            self._address = user_input[CONF_ADDRESS]
+            address = user_input[CONF_ADDRESS]
+            if self._address != address:
+                self._onboarding_seed = None
+            self._address = address
             self._name = self._discovered.get(self._address)
             await self.async_set_unique_id(self._address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
@@ -120,7 +124,9 @@ class VertuoConfigFlow(ConfigFlow, domain=DOMAIN):
                         return self._create_entry(seed)
                     errors["base"] = result
             else:
-                seed = generate_pairing_seed()
+                if self._onboarding_seed is None:
+                    self._onboarding_seed = generate_pairing_seed()
+                seed = self._onboarding_seed
                 result = await self._try_onboard(seed)
                 if result is None:
                     return self._create_entry(seed)

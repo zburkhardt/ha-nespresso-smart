@@ -81,6 +81,7 @@ def _make_device(monkeypatch: pytest.MonkeyPatch, client: FakeClient):
     ble_device = types.SimpleNamespace(address="AA:BB:CC:DD:EE:FF", name="CV5_test")
 
     async def fake_establish_connection(*_args: Any, **_kwargs: Any) -> FakeClient:
+        client.is_connected = True
         return client
 
     monkeypatch.setattr(device, "establish_connection", fake_establish_connection)
@@ -316,6 +317,37 @@ def test_hanging_disconnect_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> Non
     asyncio.run(scenario())
 
     assert not dev.is_connected
+
+
+def test_cancelled_disconnect_finishes_releasing_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeClient()
+    dev = _make_device(monkeypatch, client)
+
+    async def scenario() -> None:
+        closing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def disconnect() -> None:
+            closing.set()
+            await release.wait()
+            client.is_connected = False
+
+        monkeypatch.setattr(client, "disconnect", disconnect)
+        await dev.connect()
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(dev.disconnect())
+            await closing.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not client.is_connected
+
+    asyncio.run(scenario())
 
 
 def test_optional_read_timeout_does_not_fail_the_update(

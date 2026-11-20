@@ -6,7 +6,7 @@
 <h1 align="center">Nespresso Smart for Home Assistant</h1>
 
 <p align="center">
-  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=FezVrasta&amp;repository=ha-nespresso-smart&amp;category=integration"><img
+  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=zburkhardt&amp;repository=ha-nespresso-smart&amp;category=integration"><img
      src="https://my.home-assistant.io/badges/hacs_repository.svg"
      alt="Open this repository in HACS on your Home Assistant instance"></a>
 </p>
@@ -14,12 +14,15 @@
 <p align="center">
   <img src="https://img.shields.io/badge/HACS-custom-41BDF5.svg" alt="HACS custom repository">
   <img src="https://img.shields.io/badge/licence-MIT-blue.svg" alt="MIT licence">
-  <img src="https://img.shields.io/badge/Home%20Assistant-2024.12%2B-41BDF5.svg" alt="Requires Home Assistant 2024.12 or newer">
+  <img src="https://img.shields.io/badge/Home%20Assistant-2026.10%2B-41BDF5.svg" alt="Requires Home Assistant 2026.10 or newer">
 </p>
 
 Bring your Bluetooth-connected Nespresso **Vertuo** machine into Home Assistant.
 Water tank, capsule container, descaling reminders and live brewing state, all
 locally over Bluetooth. No cloud account polling, no bridge.
+
+This fork of [Federico Zivolo's Nespresso Smart integration](https://github.com/FezVrasta/ha-nespresso-smart)
+contains a test build for Bluetooth recovery, diagnostics, and brew events.
 
 Works with **Vertuo Pop, Pop+, Next, Lattissima and Creatista**.
 
@@ -34,13 +37,14 @@ Works with **Vertuo Pop, Pop+, Next, Lattissima and Creatista**.
 | **Cleaning** | Not needed / Needed |
 | **Error** | None / Present |
 | **Brewing unit** | Closed / Open |
-| **Brewing** | Running while a cup is being made |
+| **Brewing** | Running while reading a capsule or brewing |
+| **Brew cycle** | Emits **Brew ended** when an observed brew returns to ready |
 | **Water hardness** | Read *and* set it (0 to 4) |
 
 Plus serial number and firmware versions as diagnostics.
 
-State arrives by push, so **Brewing** flips within a second of you pulling the
-lever. That's fast enough to trigger "your coffee is ready" notifications.
+Status updates are pushed over the Bluetooth link. Home Assistant also polls as
+a fallback when notifications are unavailable.
 
 > **It can't start a coffee.** Vertuo machines read a barcode on the capsule to
 > pick their programme and need the lever cycled by hand, so there's no remote
@@ -56,18 +60,22 @@ lever. That's fast enough to trigger "your coffee is ready" notifications.
   weak, so if your HA box isn't in the kitchen, put an
   [ESPHome Bluetooth proxy](https://esphome.io/projects/?type=bluetooth) nearby.
   That's the reliable setup.
-- Home Assistant 2024.12 or newer.
+- Home Assistant 2026.10 or newer.
 
 ## Install
 
 **HACS, one click.** Click the button, then *Download*, then restart Home
 Assistant.
 
-[![Open this repository in HACS on your Home Assistant instance](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=FezVrasta&repository=ha-nespresso-smart&category=integration)
+[![Open this repository in HACS on your Home Assistant instance](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=zburkhardt&repository=ha-nespresso-smart&category=integration)
 
 **HACS, manually.** HACS → ⋮ → *Custom repositories* → add
-`https://github.com/FezVrasta/ha-nespresso-smart` as type *Integration*, then
-install "Nespresso Smart" and restart.
+`https://github.com/zburkhardt/ha-nespresso-smart` as type *Integration*, then
+install **Nespresso Smart (zburkhardt fork)** and restart.
+
+**Switching from the upstream build.** Remove the upstream download in HACS
+first, then download this fork before restarting. Keep the existing Nespresso
+Smart entry in **Devices & Services** to reuse its pairing key and entity IDs.
 
 **No HACS.** Copy `custom_components/nespresso_smart/` into your
 `config/custom_components/` folder and restart.
@@ -125,18 +133,25 @@ the phone app.
 
 ## Automation ideas
 
+Use your machine's **Brew cycle** event entity for a notification when brewing
+ends. A manual stop can also trigger the event. Home Assistant needs to observe
+the brew start and the return to ready on the same Bluetooth connection.
+Replace the example entity IDs and notification action with the ones in your
+Home Assistant instance.
+
 ```yaml
 automation:
-  - alias: "Coffee is ready"
+  - alias: "Coffee brewing ended"
     triggers:
-      - trigger: state
-        entity_id: binary_sensor.nespresso_vertuo_pop_brewing
-        from: "on"
-        to: "off"
+      - trigger: event.received
+        target:
+          entity_id: event.nespresso_vertuo_next_brew_cycle
+        options:
+          event_type: brew_ended
     actions:
-      - action: notify.mobile_app
+      - action: notify.mobile_app_your_phone
         data:
-          message: "Your coffee is ready."
+          message: "The Nespresso has stopped brewing."
 
   - alias: "Empty the capsule bin"
     triggers:
@@ -145,7 +160,7 @@ automation:
         to: "full"
         for: "00:10:00"
     actions:
-      - action: notify.mobile_app
+      - action: notify.mobile_app_your_phone
         data:
           message: "The Nespresso capsule container is full."
 
@@ -155,7 +170,7 @@ automation:
         entity_id: sensor.nespresso_vertuo_pop_water_tank
         to: "empty"
     actions:
-      - action: notify.mobile_app
+      - action: notify.mobile_app_your_phone
         data:
           message: "The Nespresso water tank is empty."
 ```
@@ -175,8 +190,11 @@ from your account and paste that in instead.
 it closer to a proxy, or power-cycle the machine and retry.
 
 **Entities show as unavailable.** The machine drops its Bluetooth link in
-standby, and Home Assistant reconnects on the next poll. Persistent
-unavailability usually means it's out of range.
+standby. Home Assistant tries to reconnect when it sees the machine advertise
+again, with the 60-second poll as a fallback. If the issue persists, use
+**Download diagnostics** on the integration page. The download includes the
+model, firmware, connection timing, and the last 30 status changes for this
+Home Assistant session.
 
 ## Under the hood
 

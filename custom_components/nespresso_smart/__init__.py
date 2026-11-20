@@ -11,6 +11,7 @@ from .coordinator import VertuoCoordinator
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
+    Platform.EVENT,
     Platform.NUMBER,
     Platform.SENSOR,
 ]
@@ -26,10 +27,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: VertuoConfigEntry) -> bo
         address=entry.data[CONF_ADDRESS],
         seed=entry.data[CONF_PAIRING_SEED],
     )
-    await coordinator.async_config_entry_first_refresh()
-
-    entry.runtime_data = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await coordinator.async_config_entry_first_refresh()
+        entry.runtime_data = coordinator
+        coordinator.async_listen_for_wake()
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await coordinator.async_shutdown()
+        raise
     return True
 
 

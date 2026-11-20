@@ -15,7 +15,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - run: pip install ruff
 
@@ -26,19 +26,20 @@ jobs:
         run: ruff format --check custom_components tools tests
 
   test:
-    name: Protocol codec and BLE transport
+    name: Home Assistant 2026.10 and BLE unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
-      # protocol.py is deliberately free of Home Assistant and bleak imports,
-      # so the codec tests need nothing but pytest. The transport tests drive
-      # device.py against a fake client, which does need bleak importable.
-      - run: pip install pytest bleak bleak-retry-connector
+      - name: Install minimum-version test dependencies
+        run: >-
+          python -m pip install pytest homeassistant==2026.10.0
+          bleak==3.0.2 bleak-retry-connector==4.7.1 bluetooth-adapters==2.4.0
+          habluetooth==7.1.2 aiousbwatcher==1.1.2 serialx==1.11.0 aiohasupervisor==0.6.0
 
       - name: Run tests
-        run: pytest tests -q
+        run: python -m pytest -q

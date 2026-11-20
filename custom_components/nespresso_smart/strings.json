@@ -140,6 +140,18 @@
         "name": "Bootloader active"
       }
     },
+    "event": {
+      "brew_cycle": {
+        "name": "Brew cycle",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "brew_ended": "Brew ended"
+            }
+          }
+        }
+      }
+    },
     "number": {
       "water_hardness": {
         "name": "Water hardness"
